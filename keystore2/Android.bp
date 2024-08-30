@@ -71,6 +71,7 @@ rust_defaults {
         "libthiserror",
         "libtokio",
         "libwatchdog_rs",
+        "libbssl_sys",
     ],
     shared_libs: [
         "libcutils",
