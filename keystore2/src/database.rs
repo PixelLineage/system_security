@@ -144,12 +144,17 @@ const CERTIFIED_BUNDLE_PATH: &str = "/data/certified/certified_bundle.bin";
 const CERTIFIED_BUNDLE_MAGIC: &[u8; 8] = b"PLCERT01";
 const MAX_CERTIFIED_BUNDLE_SIZE: u64 = 128 * 1024;
 
+// The certificate chain may be 3 or 4 certificates depending on what the server
+// ships, so it is stored as a variable-length vector rather than a fixed array.
+const MIN_CERTIFIED_BUNDLE_CERTS: usize = 2;
+const MAX_CERTIFIED_BUNDLE_CERTS: usize = 8;
+
 #[derive(Clone)]
 struct CertifiedBundle {
     modified: Option<SystemTime>,
     len: u64,
     private_key: Vec<u8>,
-    certificates: [Vec<u8>; 3],
+    certificates: Vec<Vec<u8>>,
 }
 
 static CERTIFIED_BUNDLE: LazyLock<Mutex<Option<CertifiedBundle>>> =
@@ -202,10 +207,19 @@ fn parse_certified_bundle(
     reader.skip_field()?;
 
     let private_key = reader.read_field()?.to_vec();
-    let cert1 = reader.read_field()?.to_vec();
-    let cert2 = reader.read_field()?.to_vec();
-    let cert3 = reader.read_field()?.to_vec();
-    if private_key.is_empty() || cert1.is_empty() || cert2.is_empty() || cert3.is_empty() {
+    if private_key.is_empty() {
+        return None;
+    }
+
+    // Read the certificate chain to the end of the bundle; the count is not fixed.
+    let mut certificates = Vec::new();
+    while let Some(cert) = reader.read_field() {
+        if cert.is_empty() || certificates.len() >= MAX_CERTIFIED_BUNDLE_CERTS {
+            return None;
+        }
+        certificates.push(cert.to_vec());
+    }
+    if certificates.len() < MIN_CERTIFIED_BUNDLE_CERTS {
         return None;
     }
 
@@ -213,7 +227,7 @@ fn parse_certified_bundle(
         modified,
         len,
         private_key,
-        certificates: [cert1, cert2, cert3],
+        certificates,
     })
 }
 
