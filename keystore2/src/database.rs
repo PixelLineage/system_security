@@ -268,21 +268,100 @@ impl<'a> CertifiedBundleReader<'a> {
 use bssl_sys::*;
 use std::ptr;
 
-// Common extension bytes on unlocked bootloader devices
-const PATTERN: [u8; 42] = [48, 74, 4, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 10, 1, 2];
-const PATTERN_LEN: usize = PATTERN.len();
+// verifiedBootKey to graft into the RootOfTrust (SHA-256-sized, 32 bytes).
+const VERIFIED_BOOT_KEY: [u8; 32] = [19, 78, 158, 95, 136, 102, 49, 15, 7, 98, 143, 151, 213, 206, 155, 85, 200, 171, 36, 109, 142, 116, 181, 123, 83, 2, 146, 171, 251, 226, 29, 80];
 
-const OCTET_STRING: [u8; 32] = [19, 78, 158, 95, 136, 102, 49, 15, 7, 98, 143, 151, 213, 206, 155, 85, 200, 171, 36, 109, 142, 116, 181, 123, 83, 2, 146, 171, 251, 226, 29, 80];
+// Context tag [704] EXPLICIT = rootOfTrust in the KeyMint attestation
+// AuthorizationList. High-tag-number form: 0xBF 0x85 0x40. This is stable
+// across attestation versions, unlike the raw RootOfTrust value bytes.
+const ROOT_OF_TRUST_TAG: [u8; 3] = [0xBF, 0x85, 0x40];
 
-// Modify the ASN1 Octet String (verifiedBootKey), the ASN1 Boolean (deviceLocked) and the ASN1 Enumerated (verifiedBootState)
-fn modify_if_pattern_found(bytes: &mut [u8]) -> bool {
-    if let Some(index) = bytes.windows(PATTERN_LEN).position(|window| window == PATTERN) {
-        bytes[(index + 4)..(index + 36)].copy_from_slice(&OCTET_STRING[..32]);
-        bytes[index + 38] = 1;
-        bytes[index + 41] = 0;
-        return true;
+// Reads a DER length that begins at `pos`. Returns the offset where the value
+// starts and the value length. Supports the definite short and long forms.
+fn read_der_len(bytes: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let first = *bytes.get(pos)?;
+    if first < 0x80 {
+        return Some((pos + 1, first as usize));
     }
-    false
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 4 {
+        return None;
+    }
+    let mut len = 0usize;
+    for i in 0..n {
+        len = (len << 8) | *bytes.get(pos + 1 + i)? as usize;
+    }
+    Some((pos + 1 + n, len))
+}
+
+// Locate the RootOfTrust structurally (by its [704] context tag) and overwrite
+// verifiedBootKey, deviceLocked and verifiedBootState in place. Lengths are
+// preserved, so the surrounding DER needs no re-encoding. Robust across
+// attestation versions and whatever verifiedBootHash the device emits, because
+// the fields are walked rather than matched against a fixed byte window.
+fn patch_root_of_trust(bytes: &mut [u8]) -> bool {
+    let tag_pos =
+        match bytes.windows(ROOT_OF_TRUST_TAG.len()).position(|w| w == ROOT_OF_TRUST_TAG) {
+            Some(p) => p,
+            None => return false,
+        };
+
+    // Step past the [704] EXPLICIT wrapper onto the inner RootOfTrust SEQUENCE.
+    let (seq_hdr, _) = match read_der_len(bytes, tag_pos + ROOT_OF_TRUST_TAG.len()) {
+        Some(v) => v,
+        None => return false,
+    };
+    if bytes.get(seq_hdr).copied() != Some(0x30) {
+        return false;
+    }
+    let (mut pos, seq_len) = match read_der_len(bytes, seq_hdr + 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    let seq_end = pos + seq_len;
+
+    // 1) verifiedBootKey OCTET STRING -> graft our key (only if same length).
+    if bytes.get(pos).copied() != Some(0x04) {
+        return false;
+    }
+    let (bk_val, bk_len) = match read_der_len(bytes, pos + 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    if bk_val + bk_len > seq_end {
+        return false;
+    }
+    if bk_len == VERIFIED_BOOT_KEY.len() {
+        bytes[bk_val..bk_val + bk_len].copy_from_slice(&VERIFIED_BOOT_KEY);
+    }
+    pos = bk_val + bk_len;
+
+    // 2) deviceLocked BOOLEAN -> true.
+    if bytes.get(pos).copied() != Some(0x01) {
+        return false;
+    }
+    let (dl_val, dl_len) = match read_der_len(bytes, pos + 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    if dl_len == 1 {
+        bytes[dl_val] = 1;
+    }
+    pos = dl_val + dl_len;
+
+    // 3) verifiedBootState ENUMERATED -> Verified (0).
+    if bytes.get(pos).copied() != Some(0x0A) {
+        return false;
+    }
+    let (vs_val, vs_len) = match read_der_len(bytes, pos + 1) {
+        Some(v) => v,
+        None => return false,
+    };
+    if vs_len == 1 {
+        bytes[vs_val] = 0;
+    }
+
+    true
 }
 
 #[allow(clippy::undocumented_unsafe_blocks)]
@@ -293,7 +372,7 @@ fn modify_certificate(bytes: &mut Vec<u8>) {
     };
 
     let mut modified = bytes.clone();
-    if !modify_if_pattern_found(&mut modified) {
+    if !patch_root_of_trust(&mut modified) {
         return;
     }
 
